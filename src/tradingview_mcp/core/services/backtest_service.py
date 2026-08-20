@@ -189,13 +189,15 @@ def _run_donchian(candles, period=20, **_):
     dc     = calc_donchian(highs, lows, period)
     trades, position = [], None
     for i in range(1, len(candles)):
-        if dc["upper"][i] is None:
+        # Compare against the channel formed by the PRIOR window (index i-1).
+        # dc["upper"][i]/[i] include bar i itself, so highs[i] can never exceed
+        # dc["upper"][i] (a value can't beat a max that contains it) -> 0 trades.
+        if dc["upper"][i - 1] is None or dc["lower"][i - 1] is None:
             continue
         price, date = candles[i]["close"], candles[i]["date"]
-        prev_high   = highs[i - 1]
-        if position is None and dc["upper"][i - 1] is not None and prev_high > dc["upper"][i - 1]:
+        if position is None and highs[i] > dc["upper"][i - 1]:
             position = {"entry_date": date, "entry_price": price, "strategy": "donchian"}
-        elif position is not None and dc["lower"][i] is not None and price < dc["lower"][i]:
+        elif position is not None and lows[i] < dc["lower"][i - 1]:
             trades.append({**position, "exit_date": date, "exit_price": price})
             position = None
     return trades
@@ -428,6 +430,41 @@ def _buy_and_hold_return(candles: list[dict]) -> float:
     return round((candles[-1]["close"] - candles[0]["close"]) / candles[0]["close"] * 100, 2)
 
 
+# ─── Numeric input validation ─────────────────────────────────────────────────
+
+# Commission and slippage are per-trade percentages. 100% per side is already
+# absurd, so the cap simply rejects grossly out-of-range inputs (e.g. a value
+# passed in basis points, 250, instead of as a percent, 2.5) before they
+# silently corrupt results.
+_MAX_COST_PCT = 100.0
+
+
+def _validate_numeric_inputs(
+    initial_capital: float,
+    commission_pct: float,
+    slippage_pct: float,
+) -> Optional[str]:
+    """Return an error message if a capital/cost input is out of range, else None.
+
+    Follows the same structured-error convention as the strategy/period checks:
+    callers return ``{"error": msg}`` rather than raising. Without this, two
+    silent-corruption paths are reachable from the public tools:
+
+      * ``initial_capital <= 0`` → division by initial_capital in the trade log,
+        equity curve, and metrics (0 raises ZeroDivisionError; negative flips the
+        sign of every return).
+      * negative ``commission_pct``/``slippage_pct`` → costs become a *credit*,
+        silently inflating every trade's net return above its gross.
+    """
+    if initial_capital <= 0:
+        return f"initial_capital must be positive, got {initial_capital}"
+    if not (0 <= commission_pct <= _MAX_COST_PCT):
+        return f"commission_pct must be between 0 and {_MAX_COST_PCT}, got {commission_pct}"
+    if not (0 <= slippage_pct <= _MAX_COST_PCT):
+        return f"slippage_pct must be between 0 and {_MAX_COST_PCT}, got {slippage_pct}"
+    return None
+
+
 # ─── Public API: run_backtest ─────────────────────────────────────────────────
 
 def run_backtest(
@@ -451,6 +488,10 @@ def run_backtest(
         return {"error": f"Invalid period '{period}'. Choose: {', '.join(_VALID_PERIODS)}"}
     if interval not in _VALID_INTERVALS:
         return {"error": f"Invalid interval '{interval}'. Choose: 1d or 1h"}
+
+    num_err = _validate_numeric_inputs(initial_capital, commission_pct, slippage_pct)
+    if num_err:
+        return {"error": num_err}
 
     try:
         candles = _fetch_ohlcv(symbol, period, interval)
@@ -516,6 +557,10 @@ def compare_strategies(
     interval = interval.lower().strip()
     if interval not in _VALID_INTERVALS:
         return {"error": f"Invalid interval '{interval}'. Choose: 1d or 1h"}
+
+    num_err = _validate_numeric_inputs(initial_capital, commission_pct, slippage_pct)
+    if num_err:
+        return {"error": num_err}
 
     try:
         candles = _fetch_ohlcv(symbol, period, interval)
@@ -623,6 +668,10 @@ def walk_forward_backtest(
                           f"(~{_SMA200_MIN_BARS} bars) which exceeds typical "
                           f"walk-forward fold sizes. Use run_backtest with "
                           f"period='2y' instead, or pick a shorter-warmup strategy.")}
+
+    num_err = _validate_numeric_inputs(initial_capital, commission_pct, slippage_pct)
+    if num_err:
+        return {"error": num_err}
 
     try:
         candles = _fetch_ohlcv(symbol, period, interval)

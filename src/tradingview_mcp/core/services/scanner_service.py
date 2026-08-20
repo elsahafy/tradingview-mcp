@@ -15,20 +15,27 @@ import sys
 import time as _time
 from typing import List, Optional
 
-from tradingview_mcp.core.errors import BatchExecutionError
+from tradingview_mcp.core.errors import BatchExecutionError, ErrorCode, is_error, make_error
 from tradingview_mcp.core.services.coinlist import load_symbols
-from tradingview_mcp.core.services.indicators import compute_metrics
 from tradingview_mcp.core.services.screener_service import (
     _batch_budget_s,
     _batch_max_consecutive_fails,
+    pick_fallback_exchange,
+    symbol_not_found_error,
 )
-from tradingview_mcp.core.utils.validators import EXCHANGE_SCREENER, is_stock_exchange
+from tradingview_mcp.core.services.indicators import compute_metrics
+from tradingview_mcp.core.utils.validators import (
+    EXCHANGE_SCREENER,
+    normalize_tradingview_symbol,
+    resolve_screener_for_symbol,
+)
 
 try:
     # Patched: route through resilience layer (retry + 60s TTL cache).
     import tradingview_ta  # noqa: F401  presence check
     from tradingview_mcp.core.services.screener_provider import (
         resilient_get_multiple_analysis as get_multiple_analysis,
+        humanize_upstream_error,
     )
     _TA_AVAILABLE = True
 except ImportError:
@@ -194,6 +201,7 @@ def volume_confirmation_analyze(
     symbol: str,
     exchange: str,
     timeframe: str,
+    _allow_venue_fallback: bool = True,
 ) -> dict:
     """
     Detailed volume confirmation analysis for a single asset.
@@ -206,27 +214,58 @@ def volume_confirmation_analyze(
     Returns:
         Dict with price data, volume analysis, technical indicators, and signals.
     """
-    # Normalise symbol
-    if not is_stock_exchange(exchange) and not symbol.upper().endswith("USDT"):
-        symbol = symbol.upper() + "USDT"
-    else:
-        symbol = symbol.upper()
-
-    if is_stock_exchange(exchange) and ":" not in symbol:
-        full_symbol = f"{exchange.upper()}:{symbol}"
-    else:
-        full_symbol = symbol
-
-    screener = EXCHANGE_SCREENER.get(exchange, "crypto")
+    # Resolve to a fully-qualified EXCHANGE:TICKER via the canonical helper — the
+    # exact path analyze_coin() (coin_analysis) uses. The old hand-rolled
+    # normalisation only prefixed the venue for STOCK exchanges, so every crypto
+    # symbol reached tradingview_ta as a bare ticker (e.g. "BTCUSDT") and was
+    # rejected with "Symbol should be a list of exchange and ticker" — ~99% of
+    # volume_confirmation_analysis calls failed. This also fixes forex/commodity
+    # symbols (XAUUSD -> TVC:GOLD) and picks the screener from the resolved venue.
+    full_symbol = normalize_tradingview_symbol(symbol, exchange)
+    screener = resolve_screener_for_symbol(full_symbol, exchange)
 
     try:
         analysis = get_multiple_analysis(screener=screener, interval=timeframe, symbols=[full_symbol])
         if not analysis or full_symbol not in analysis:
-            return {"error": f"No data found for {full_symbol}"}
+            if _allow_venue_fallback:
+                alt = pick_fallback_exchange(symbol, exchange)
+                if alt:
+                    result = volume_confirmation_analyze(symbol, alt, timeframe, _allow_venue_fallback=False)
+                    if not is_error(result):
+                        result["requested_exchange"] = exchange
+                        result["resolved_exchange"] = alt
+                        result["resolution_note"] = (
+                            f"{symbol} has no usable data on {exchange}; analysis was run on "
+                            f"{alt}, which lists it. Pass exchange='{alt}' to silence this note."
+                        )
+                        return result
+            return symbol_not_found_error(
+                symbol, exchange, timeframe=timeframe, full_symbol=full_symbol
+            )
 
         data = analysis[full_symbol]
         if not data or not hasattr(data, "indicators"):
-            return {"error": f"No indicator data for {full_symbol}"}
+            if _allow_venue_fallback:
+                alt = pick_fallback_exchange(symbol, exchange)
+                if alt:
+                    result = volume_confirmation_analyze(symbol, alt, timeframe, _allow_venue_fallback=False)
+                    if not is_error(result):
+                        result["requested_exchange"] = exchange
+                        result["resolved_exchange"] = alt
+                        result["resolution_note"] = (
+                            f"{symbol} has no usable data on {exchange}; analysis was run on "
+                            f"{alt}, which lists it. Pass exchange='{alt}' to silence this note."
+                        )
+                        return result
+            return make_error(
+                ErrorCode.NO_DATA,
+                f"No indicator data for {full_symbol}. The venue returned a row "
+                "without indicators — retrying the same request will not help; "
+                "try another timeframe or exchange.",
+                retryable=False,
+                symbol=symbol, exchange=exchange, timeframe=timeframe,
+                full_symbol=full_symbol,
+            )
 
         ind = data.indicators
         volume = ind.get("volume", 0)
@@ -299,7 +338,12 @@ def volume_confirmation_analyze(
             },
         }
     except Exception as exc:
-        return {"error": f"Analysis failed: {exc}"}
+        return make_error(
+            ErrorCode.UPSTREAM_ERROR,
+            f"Analysis failed: {humanize_upstream_error(exc)}",
+            retryable=True, retry_after_s=60,
+            symbol=symbol, exchange=exchange, timeframe=timeframe,
+        )
 
 
 # ── Smart volume scanner ───────────────────────────────────────────────────────

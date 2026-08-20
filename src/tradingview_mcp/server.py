@@ -11,10 +11,12 @@ No business logic lives here. All computation is in core/services/*.
 from __future__ import annotations
 
 import argparse
+import asyncio
 import os
 from typing import Optional
 
 from mcp.server.fastmcp import FastMCP
+from mcp.types import ToolAnnotations
 
 # ── Service imports ────────────────────────────────────────────────────────────
 from tradingview_mcp.core.services.coinlist import load_symbols
@@ -42,17 +44,34 @@ from tradingview_mcp.core.services.egx_service import (
     generate_egx_trade_plan,
     analyze_egx_fibonacci,
 )
-from tradingview_mcp.core.services.sentiment_service import analyze_sentiment
-from tradingview_mcp.core.services.news_service import fetch_news_summary
+from tradingview_mcp.core.services.marketaux_service import (
+    analyze_sentiment,
+    fetch_news_summary,
+)
 from tradingview_mcp.core.services.yahoo_finance_service import (
     get_price,
+    get_price_async,
     get_market_snapshot,
 )
 from tradingview_mcp.core.services.bitcoin_market_service import get_bitcoin_market_pulse
-from tradingview_mcp.core.services.extended_hours_service import get_extended_hours_price
+from tradingview_mcp.core.services.extended_hours_service import (
+    get_extended_hours_price,
+    get_extended_hours_price_async,
+)
 from tradingview_mcp.core.services.options_service import (
     get_options_chain,
     get_unusual_options_activity,
+)
+from tradingview_mcp.core.services.futures_service import (
+    get_futures_overview,
+    get_futures_movers,
+    get_futures_category_snapshot,
+    get_futures_watchlist,
+)
+from tradingview_mcp.core.services.stock_screener_service import (
+    EXAMPLE_MARKETS,
+    fetch_stock_prices,
+    screen_stocks,
 )
 from tradingview_mcp.core.services.backtest_service import (
     run_backtest,
@@ -66,8 +85,8 @@ from tradingview_mcp.core.utils.validators import (
     normalize_yahoo_symbol,
 )
 from tradingview_mcp.core.errors import (
-    BatchExecutionError,
     ErrorCode,
+    exception_to_envelope,
     make_error,
 )
 
@@ -84,18 +103,21 @@ mcp = FastMCP(
     name="TradingView Multi-Market Screener",
     instructions=(
         "Multi-market screener backed by TradingView. "
-        "Supports crypto exchanges (KuCoin, Binance, Bybit, MEXC, etc.) and stock markets "
-        "(EGX, BIST, NASDAQ, NYSE, Bursa Malaysia, HKEX, SSE, SZSE, TWSE, TPEX). "
+        "Supports crypto exchanges (KuCoin, Binance, Bybit, MEXC, etc.), stock markets "
+        "(EGX, BIST, NASDAQ, NYSE, Bursa Malaysia, HKEX, SSE, SZSE, TWSE, TPEX), "
+        "and futures markets (CME, COMEX, NYMEX, CBOT — equity index, energy, metals, "
+        "agriculture, rates, forex, crypto futures). "
         "Tools: top_gainers, top_losers, bollinger_scan, coin_analysis, multi_agent_analysis, "
-        "volume_breakout_scanner, egx_market_overview, egx_sector_scan, and more."
+        "volume_breakout_scanner, futures_market_overview, futures_top_movers, "
+        "futures_category_snapshot, futures_watchlist, egx_market_overview, and more."
     ),
 )
 
 
 # ── Screener tools ─────────────────────────────────────────────────────────────
 
-@mcp.tool()
-def top_gainers(exchange: str = "KUCOIN", timeframe: str = "15m", limit: int = 25) -> list[dict] | dict:
+@mcp.tool(annotations=ToolAnnotations(title="Top Gainers Screener", readOnlyHint=True, destructiveHint=False, openWorldHint=True))
+async def top_gainers(exchange: str = "KUCOIN", timeframe: str = "15m", limit: int = 25) -> list[dict] | dict:
     """Return top gainers for an exchange and timeframe using Bollinger Band analysis.
 
     Args:
@@ -104,65 +126,73 @@ def top_gainers(exchange: str = "KUCOIN", timeframe: str = "15m", limit: int = 2
         limit: Number of rows to return (max 50)
 
     Returns:
-        list[dict] on success. On total upstream failure returns a structured
-        error envelope: ``{"error": {"code": "ALL_BATCHES_FAILED", ...}}``.
+        list[dict] on success. On ANY failure returns a structured error
+        envelope ``{"error": {"code": ..., "retryable": ...}}`` — never a
+        raw exception string.
     """
     exchange = sanitize_exchange(exchange, "KUCOIN")
     timeframe = sanitize_timeframe(timeframe, "15m")
     limit = max(1, min(limit, 50))
     try:
-        rows = fetch_trending_analysis(exchange, timeframe=timeframe, limit=limit)
-    except BatchExecutionError as e:
-        return make_error(
-            ErrorCode.ALL_BATCHES_FAILED, str(e),
-            batches_attempted=e.batches_attempted,
-            batches_failed=e.batches_failed,
-            first_error=e.first_error,
+        # Underlying tradingview-screener is sync (uses urllib). Push to a
+        # worker thread so the event loop is free for other concurrent
+        # tool calls.
+        rows = await asyncio.to_thread(
+            fetch_trending_analysis, exchange, timeframe=timeframe, limit=limit
         )
+    except Exception as e:
+        return exception_to_envelope(e, context="top_gainers")
     return [{"symbol": r["symbol"], "changePercent": r["changePercent"], "indicators": dict(r["indicators"])} for r in rows]
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(title="Top Losers Screener", readOnlyHint=True, destructiveHint=False, openWorldHint=True))
 def top_losers(exchange: str = "KUCOIN", timeframe: str = "15m", limit: int = 25) -> list[dict] | dict:
     """Return top losers for an exchange and timeframe. Supports crypto (KUCOIN, BINANCE, MEXC) and stocks (EGX, BIST, NASDAQ).
 
-    Returns ``list[dict]`` on success, or an error envelope on total upstream
-    failure (``{"error": {"code": "ALL_BATCHES_FAILED", ...}}``).
+    Returns ``list[dict]`` on success. On ANY failure returns a structured
+    error envelope ``{"error": {"code": ..., "retryable": ...}}``.
     """
     exchange = sanitize_exchange(exchange, "KUCOIN")
     timeframe = sanitize_timeframe(timeframe, "15m")
     limit = max(1, min(limit, 50))
     try:
         rows = fetch_trending_analysis(exchange, timeframe=timeframe, limit=limit)
-    except BatchExecutionError as e:
-        return make_error(
-            ErrorCode.ALL_BATCHES_FAILED, str(e),
-            batches_attempted=e.batches_attempted,
-            batches_failed=e.batches_failed,
-            first_error=e.first_error,
-        )
+    except Exception as e:
+        return exception_to_envelope(e, context="top_losers")
     rows.sort(key=lambda x: x["changePercent"])
     return [{"symbol": r["symbol"], "changePercent": r["changePercent"], "indicators": dict(r["indicators"])} for r in rows[:limit]]
 
 
-@mcp.tool()
-def bollinger_scan(exchange: str = "KUCOIN", timeframe: str = "4h", bbw_threshold: float = 0.04, limit: int = 50) -> list[dict]:
+@mcp.tool(annotations=ToolAnnotations(title="Bollinger Squeeze Scanner", readOnlyHint=True, destructiveHint=False, openWorldHint=True))
+def bollinger_scan(exchange: str = "KUCOIN", timeframe: str = "4h", bbw_threshold: float = 0.04, limit: int = 50) -> list[dict] | dict:
     """Scan for assets with low Bollinger Band Width (squeeze detection). Works with crypto and stocks.
+
+    This scans a whole EXCHANGE for squeezes (canonical name is exactly
+    `bollinger_scan`; there is no "get_bollinger_band_analysis" tool). For
+    the Bollinger read of ONE symbol, call `coin_analysis` instead.
+
+    Example: bollinger_scan(exchange="BINANCE", timeframe="15m", bbw_threshold=0.008)
 
     Args:
         exchange: Exchange — crypto: KUCOIN, BINANCE, BYBIT, MEXC; stocks: EGX, BIST, NASDAQ, NYSE, BURSA, HKEX, SSE, SZSE, TWSE, TPEX
-        timeframe: One of 5m, 15m, 1h, 4h, 1D, 1W, 1M
+        timeframe: One of 5m, 15m, 1h, 4h, 1D, 1W, 1M. Typical squeeze thresholds: 15m→0.008, 1h→0.02, 4h→0.04, 1D→0.12
         bbw_threshold: Maximum BBW value to filter (default 0.04)
         limit: Number of rows to return (max 100)
+
+    Returns ``list[dict]`` on success. On ANY failure returns a structured
+    error envelope ``{"error": {"code": ..., "retryable": ...}}``.
     """
     exchange = sanitize_exchange(exchange, "KUCOIN")
     timeframe = sanitize_timeframe(timeframe, "4h")
     limit = max(1, min(limit, 100))
-    rows = fetch_bollinger_analysis(exchange, timeframe=timeframe, bbw_filter=bbw_threshold, limit=limit)
+    try:
+        rows = fetch_bollinger_analysis(exchange, timeframe=timeframe, bbw_filter=bbw_threshold, limit=limit)
+    except Exception as e:
+        return exception_to_envelope(e, context="bollinger_scan")
     return [{"symbol": r["symbol"], "changePercent": r["changePercent"], "indicators": dict(r["indicators"])} for r in rows]
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(title="Bollinger Rating Filter", readOnlyHint=True, destructiveHint=False, openWorldHint=True))
 def rating_filter(exchange: str = "KUCOIN", timeframe: str = "5m", rating: int = 2, limit: int = 25) -> list[dict] | dict:
     """Filter coins by Bollinger Band rating.
 
@@ -172,8 +202,8 @@ def rating_filter(exchange: str = "KUCOIN", timeframe: str = "5m", rating: int =
         rating: BB rating (-3 to +3): -3=Strong Sell, -2=Sell, -1=Weak Sell, 1=Weak Buy, 2=Buy, 3=Strong Buy
         limit: Number of rows to return (max 50)
 
-    Returns ``list[dict]`` on success, or an error envelope on total upstream
-    failure (``{"error": {"code": "ALL_BATCHES_FAILED", ...}}``).
+    Returns ``list[dict]`` on success. On ANY failure returns a structured
+    error envelope ``{"error": {"code": ..., "retryable": ...}}``.
     """
     exchange = sanitize_exchange(exchange, "KUCOIN")
     timeframe = sanitize_timeframe(timeframe, "5m")
@@ -181,25 +211,28 @@ def rating_filter(exchange: str = "KUCOIN", timeframe: str = "5m", rating: int =
     limit = max(1, min(limit, 50))
     try:
         rows = fetch_trending_analysis(exchange, timeframe=timeframe, filter_type="rating", rating_filter=rating, limit=limit)
-    except BatchExecutionError as e:
-        return make_error(
-            ErrorCode.ALL_BATCHES_FAILED, str(e),
-            batches_attempted=e.batches_attempted,
-            batches_failed=e.batches_failed,
-            first_error=e.first_error,
-        )
+    except Exception as e:
+        return exception_to_envelope(e, context="rating_filter")
     return [{"symbol": r["symbol"], "changePercent": r["changePercent"], "indicators": dict(r["indicators"])} for r in rows]
 
 
 # ── Coin / asset analysis ──────────────────────────────────────────────────────
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(title="Full Technical Analysis", readOnlyHint=True, destructiveHint=False, openWorldHint=True))
 def coin_analysis(symbol: str, exchange: str = "KUCOIN", timeframe: str = "15m") -> dict:
     """Get detailed analysis for a specific asset (coin or stock) on specified exchange and timeframe.
 
+    This is the canonical single-symbol technical readout (there is no
+    "get_technical_analysis" or "get_technical_summary" tool — use THIS one).
+    Use `multi_timeframe_analysis` instead when you need trend alignment
+    across several timeframes, and `combined_analysis` when you also want
+    news sentiment + headlines in the same call.
+
+    Example: coin_analysis(symbol="BTCUSDT", exchange="BINANCE", timeframe="1h")
+
     Args:
-        symbol: Symbol — crypto: "BTCUSDT", "ETHUSDT"; stocks: "COMI" (EGX), "THYAO" (BIST), "600519" (SSE), "300251" (SZSE), "2330" (TWSE), "3105" (TPEX)
-        exchange: Exchange — crypto: KUCOIN, BINANCE, MEXC; stocks: EGX, BIST, NASDAQ, NYSE, BURSA, HKEX, SSE, SZSE, TWSE, TPEX
+        symbol: Bare ticker, no exchange prefix — crypto: "BTCUSDT", "ETHUSDT"; stocks: "COMI" (EGX), "THYAO" (BIST), "600519" (SSE), "300251" (SZSE), "2330" (TWSE), "3105" (TPEX)
+        exchange: Exchange — crypto: KUCOIN, BINANCE, MEXC; stocks: EGX, BIST, NASDAQ, NYSE, BURSA, HKEX, SSE, SZSE, TWSE, TPEX. If the symbol isn't listed there, the error's `listed_on` field names exchanges that do list it.
         timeframe: Time interval (5m, 15m, 1h, 4h, 1D, 1W, 1M)
 
     Returns:
@@ -212,7 +245,7 @@ def coin_analysis(symbol: str, exchange: str = "KUCOIN", timeframe: str = "15m")
 
 # ── Candle pattern tools ───────────────────────────────────────────────────────
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(title="Consecutive Candles Scanner", readOnlyHint=True, destructiveHint=False, openWorldHint=True))
 def consecutive_candles_scan(
     exchange: str = "KUCOIN",
     timeframe: str = "15m",
@@ -239,7 +272,7 @@ def consecutive_candles_scan(
     return scan_consecutive_candles(exchange, timeframe, pattern_type, candle_count, min_growth, limit)
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(title="Candlestick Pattern Analysis", readOnlyHint=True, destructiveHint=False, openWorldHint=True))
 def advanced_candle_pattern(
     exchange: str = "KUCOIN",
     base_timeframe: str = "15m",
@@ -287,8 +320,8 @@ def advanced_candle_pattern(
 
 # ── Volume scanner tools ───────────────────────────────────────────────────────
 
-@mcp.tool()
-def volume_breakout_scanner(
+@mcp.tool(annotations=ToolAnnotations(title="Volume Breakout Scanner", readOnlyHint=True, destructiveHint=False, openWorldHint=True))
+async def volume_breakout_scanner(
     exchange: str = "KUCOIN",
     timeframe: str = "15m",
     volume_multiplier: float = 2.0,
@@ -315,17 +348,18 @@ def volume_breakout_scanner(
     price_change_min = max(1.0, min(20.0, price_change_min))
     limit = max(1, min(limit, 50))
     try:
-        return volume_breakout_scan(exchange, timeframe, volume_multiplier, price_change_min, limit)
-    except BatchExecutionError as e:
-        return make_error(
-            ErrorCode.ALL_BATCHES_FAILED, str(e),
-            batches_attempted=e.batches_attempted,
-            batches_failed=e.batches_failed,
-            first_error=e.first_error,
+        # volume_breakout_scan iterates many batches against the screener
+        # endpoint (sync urllib). Off-load to a worker thread to keep the
+        # event loop responsive for other concurrent tool calls.
+        return await asyncio.to_thread(
+            volume_breakout_scan,
+            exchange, timeframe, volume_multiplier, price_change_min, limit,
         )
+    except Exception as e:
+        return exception_to_envelope(e, context="volume_breakout_scanner")
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(title="Volume Confirmation Analysis", readOnlyHint=True, destructiveHint=False, openWorldHint=True))
 def volume_confirmation_analysis(symbol: str, exchange: str = "KUCOIN", timeframe: str = "15m") -> dict:
     """Detailed volume confirmation analysis for a specific coin.
 
@@ -339,7 +373,7 @@ def volume_confirmation_analysis(symbol: str, exchange: str = "KUCOIN", timefram
     return volume_confirmation_analyze(symbol, exchange, timeframe)
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(title="Smart Volume Scanner", readOnlyHint=True, destructiveHint=False, openWorldHint=True))
 def smart_volume_scanner(
     exchange: str = "KUCOIN",
     min_volume_ratio: float = 2.0,
@@ -356,9 +390,8 @@ def smart_volume_scanner(
         rsi_range: "oversold" (<30), "overbought" (>70), "neutral" (30-70), "any"
         limit: Number of results (max 30)
 
-    Returns ``list[dict]`` on success, or an error envelope on total upstream
-    failure (``{"error": {"code": "ALL_BATCHES_FAILED", ...}}``) — inherited
-    from the inner ``volume_breakout_scan`` call.
+    Returns ``list[dict]`` on success. On ANY failure returns a structured
+    error envelope ``{"error": {"code": ..., "retryable": ...}}``.
     """
     exchange = sanitize_exchange(exchange, "KUCOIN")
     min_volume_ratio = max(1.2, min(10.0, min_volume_ratio))
@@ -366,18 +399,13 @@ def smart_volume_scanner(
     limit = max(1, min(limit, 30))
     try:
         return smart_volume_scan(exchange, min_volume_ratio, min_price_change, rsi_range, limit)
-    except BatchExecutionError as e:
-        return make_error(
-            ErrorCode.ALL_BATCHES_FAILED, str(e),
-            batches_attempted=e.batches_attempted,
-            batches_failed=e.batches_failed,
-            first_error=e.first_error,
-        )
+    except Exception as e:
+        return exception_to_envelope(e, context="smart_volume_scanner")
 
 
 # ── Multi-agent analysis ───────────────────────────────────────────────────────
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(title="Multi-Agent Market Debate", readOnlyHint=True, destructiveHint=False, openWorldHint=True))
 def multi_agent_analysis(symbol: str, exchange: str = "KUCOIN", timeframe: str = "15m") -> dict:
     """Run a multi-agent debate (Technical, Sentiment, Risk) for a specific symbol.
 
@@ -397,7 +425,7 @@ def multi_agent_analysis(symbol: str, exchange: str = "KUCOIN", timeframe: str =
 
 # ── EGX market tools ───────────────────────────────────────────────────────────
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(title="EGX Market Overview", readOnlyHint=True, destructiveHint=False, openWorldHint=True))
 def egx_market_overview(timeframe: str = "1D", limit: int = 10) -> dict:
     """Get a comprehensive overview of the Egyptian Exchange (EGX) market.
 
@@ -410,7 +438,7 @@ def egx_market_overview(timeframe: str = "1D", limit: int = 10) -> dict:
     return get_egx_market_overview(timeframe, limit)
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(title="EGX Sector Scan", readOnlyHint=True, destructiveHint=False, openWorldHint=True))
 def egx_sector_scan(sector: str = "", timeframe: str = "1D", limit: int = 20) -> dict:
     """Scan EGX stocks by sector. Shows available sectors if none specified.
 
@@ -425,7 +453,7 @@ def egx_sector_scan(sector: str = "", timeframe: str = "1D", limit: int = 20) ->
     return scan_egx_sector(sector, timeframe, limit)
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(title="EGX Sector Rotation Scanner", readOnlyHint=True, destructiveHint=False, openWorldHint=True))
 def egx_sector_scanner(
     timeframe: str = "1D",
     top_n_sectors: int = 5,
@@ -447,7 +475,7 @@ def egx_sector_scanner(
     return run_egx_sector_scanner(timeframe, top_n_sectors, top_n_stocks, min_stock_score)
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(title="EGX Index Analysis", readOnlyHint=True, destructiveHint=False, openWorldHint=True))
 def egx_index_analysis(index: str = "EGX30", timeframe: str = "1D", limit: int = 30) -> dict:
     """Analyse an EGX index showing constituent performance with full indicators.
 
@@ -461,7 +489,7 @@ def egx_index_analysis(index: str = "EGX30", timeframe: str = "1D", limit: int =
     return analyze_egx_index(index, timeframe, limit)
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(title="EGX Stock Screener", readOnlyHint=True, destructiveHint=False, openWorldHint=True))
 def egx_stock_screener(
     timeframe: str = "1D",
     min_score: int = 55,
@@ -482,7 +510,7 @@ def egx_stock_screener(
     return screen_egx_stocks(timeframe, min_score, index_filter, limit)
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(title="EGX Trade Plan", readOnlyHint=True, destructiveHint=False, openWorldHint=True))
 def egx_trade_plan(symbol: str, timeframe: str = "1D") -> dict:
     """Generate a full trade plan for a specific EGX stock.
 
@@ -494,7 +522,7 @@ def egx_trade_plan(symbol: str, timeframe: str = "1D") -> dict:
     return generate_egx_trade_plan(symbol, timeframe)
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(title="EGX Fibonacci Retracement", readOnlyHint=True, destructiveHint=False, openWorldHint=True))
 def egx_fibonacci_retracement(symbol: str, lookback: str = "52W", timeframe: str = "1D") -> dict:
     """Fibonacci retracement analysis for EGX stocks.
 
@@ -510,58 +538,87 @@ def egx_fibonacci_retracement(symbol: str, lookback: str = "52W", timeframe: str
 
 # ── Multi-timeframe analysis ───────────────────────────────────────────────────
 
-@mcp.tool()
-def multi_timeframe_analysis(symbol: str, exchange: str = "KUCOIN") -> dict:
+@mcp.tool(annotations=ToolAnnotations(title="Multi-Timeframe Analysis", readOnlyHint=True, destructiveHint=False, openWorldHint=True))
+async def multi_timeframe_analysis(symbol: str, exchange: str = "KUCOIN") -> dict:
     """Multi-timeframe alignment analysis (Weekly → Daily → 4H → 1H → 15m).
 
+    Canonical name is exactly `multi_timeframe_analysis` (there is no
+    "get_multi_timeframe_analysis" tool). Use this for cross-timeframe trend
+    alignment on ONE symbol; for a single-timeframe deep dive use
+    `coin_analysis`; for TA + sentiment + news use `combined_analysis`.
+
+    Example: multi_timeframe_analysis(symbol="SOLUSDT", exchange="BINANCE")
+
     Args:
-        symbol: Symbol — crypto: "BTCUSDT"; stocks: "COMI" (EGX), "THYAO" (BIST), "600519" (SSE), "300251" (SZSE), "2330" (TWSE), "3105" (TPEX), "GDX" (AMEX)
+        symbol: Bare ticker, no exchange prefix — crypto: "BTCUSDT"; stocks: "COMI" (EGX), "THYAO" (BIST), "600519" (SSE), "300251" (SZSE), "2330" (TWSE), "3105" (TPEX), "GDX" (AMEX)
         exchange: Exchange — crypto: KUCOIN, BINANCE, MEXC; stocks: EGX, BIST, NASDAQ, NYSE, AMEX, NYSEARCA, PCX, SSE, SZSE, TWSE, TPEX
     """
     exchange = sanitize_exchange(exchange, "KUCOIN")
     full_symbol = normalize_tradingview_symbol(symbol, exchange)
-    return run_multi_timeframe_analysis(full_symbol, exchange)
+    # tradingview_ta backs this with a single threading.Semaphore-gated
+    # request; pushing the whole call to a thread keeps the event loop
+    # free while we wait on the upstream HTTP.
+    return await asyncio.to_thread(run_multi_timeframe_analysis, full_symbol, exchange)
 
 
 # ── Sentiment & news tools ─────────────────────────────────────────────────────
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(title="Market News Sentiment", readOnlyHint=True, destructiveHint=False, openWorldHint=True))
 def market_sentiment(symbol: str, category: str = "all", limit: int = 20) -> dict:
-    """Real-time Reddit sentiment analysis for stocks and crypto.
+    """News sentiment for stocks and crypto (licensed Marketaux entity sentiment).
 
     Args:
         symbol: Asset symbol ("AAPL", "BTC", "ETH", "TSLA")
-        category: Subreddit group to search ("crypto", "stocks", "all")
-        limit: Number of posts to analyse
+        category: News group to search ("crypto", "stocks", "all")
+        limit: Max articles to analyse
     """
     return analyze_sentiment(symbol, category, limit)
 
 
-@mcp.tool()
-def financial_news(symbol: str = None, category: str = "stocks", limit: int = 10) -> dict:
-    """Real-time financial news from RSS feeds (Reuters, CoinDesk, etc.)
+@mcp.tool(annotations=ToolAnnotations(title="Financial News Feed", readOnlyHint=True, destructiveHint=False, openWorldHint=True))
+async def financial_news(symbol: str = None, category: str = "stocks", limit: int = 10) -> dict:
+    """Real-time financial news via Marketaux (licensed).
 
     Args:
         symbol: Optional symbol filter ("AAPL", "BTC"). None = all news.
-        category: Feed category ("crypto", "stocks", "all")
+        category: News category ("crypto", "stocks", "all")
         limit: Max number of news items
     """
-    return fetch_news_summary(symbol, category, limit)
+    # The Marketaux fetch is sync (urllib) — offload so parallel news
+    # requests don't block the event loop.
+    return await asyncio.to_thread(fetch_news_summary, symbol, category, limit)
 
 
-@mcp.tool()
-def combined_analysis(symbol: str, exchange: str = "NASDAQ", timeframe: str = "1D") -> dict:
-    """POWER TOOL: TradingView technical analysis + Reddit sentiment + Financial news.
+@mcp.tool(annotations=ToolAnnotations(title="Combined TA + Sentiment + News", readOnlyHint=True, destructiveHint=False, openWorldHint=True))
+async def combined_analysis(symbol: str, exchange: str = "NASDAQ", timeframe: str = "1D") -> dict:
+    """POWER TOOL: TradingView technical analysis + news sentiment + financial news.
+
+    Use this when you want TA AND sentiment AND news for one symbol in a
+    single call. For indicators only, `coin_analysis` is faster; for
+    cross-timeframe trend alignment use `multi_timeframe_analysis`.
+
+    Example: combined_analysis(symbol="NVDA", exchange="NASDAQ", timeframe="1D")
 
     Args:
-        symbol: Asset symbol ("AAPL", "BTCUSDT", "THYAO", "GDX")
+        symbol: Bare ticker, no exchange prefix ("AAPL", "BTCUSDT", "THYAO", "GDX")
         exchange: Exchange (NASDAQ, NYSE, AMEX, NYSEARCA, PCX, BINANCE, KUCOIN, MEXC, BIST, EGX, TWSE, TPEX)
         timeframe: Analysis timeframe (5m, 15m, 1h, 4h, 1D, 1W)
     """
-    tech = coin_analysis(symbol, exchange, timeframe)
-    cat = "crypto" if exchange.upper() in ["BINANCE", "KUCOIN", "BYBIT", "MEXC"] else "stocks"
-    sentiment = analyze_sentiment(symbol, category=cat)
-    news = fetch_news_summary(symbol, category=cat, limit=5)
+    exchange_clean = sanitize_exchange(exchange, "NASDAQ")
+    timeframe_clean = sanitize_timeframe(timeframe, "1D")
+    cat = "crypto" if exchange_clean.upper() in ["BINANCE", "KUCOIN", "BYBIT", "MEXC"] else "stocks"
+
+    # The three sub-calls hit independent upstreams (TradingView TA,
+    # Marketaux news/sentiment) so fan them out in parallel. Pre-P4 this was
+    # ~3x sequential wall-clock; now bounded by the slowest single call.
+    # The TA throttle (threading.Semaphore in screener_provider) still
+    # caps in-flight TV calls correctly because asyncio.to_thread runs
+    # the sync call in a worker thread that respects the semaphore.
+    tech, sentiment, news = await asyncio.gather(
+        asyncio.to_thread(analyze_coin, symbol, exchange_clean, timeframe_clean),
+        asyncio.to_thread(analyze_sentiment, symbol, cat),
+        asyncio.to_thread(fetch_news_summary, symbol, cat, 5),
+    )
 
     tech_momentum = tech.get("market_sentiment", {}).get("momentum", "") if isinstance(tech, dict) else ""
     tech_bullish = tech_momentum == "Bullish"
@@ -572,8 +629,8 @@ def combined_analysis(symbol: str, exchange: str = "NASDAQ", timeframe: str = "1
 
     return {
         "symbol": symbol,
-        "exchange": exchange,
-        "timeframe": timeframe,
+        "exchange": exchange_clean,
+        "timeframe": timeframe_clean,
         "technical": tech,
         "sentiment": sentiment,
         "news": {"count": news.get("count", 0), "latest": news.get("items", [])[:3]},
@@ -583,8 +640,8 @@ def combined_analysis(symbol: str, exchange: str = "NASDAQ", timeframe: str = "1
             "recommendation": (
                 f"Technical {tech_signal} "
                 f"{'confirmed by' if signals_agree else 'conflicts with'} "
-                f"{sentiment.get('sentiment_label', 'Neutral')} Reddit sentiment "
-                f"({sentiment.get('posts_analyzed', 0)} posts analyzed)"
+                f"{sentiment.get('sentiment_label', 'Neutral')} news sentiment "
+                f"({sentiment.get('posts_analyzed', 0)} articles analyzed)"
             ),
         },
     }
@@ -592,7 +649,7 @@ def combined_analysis(symbol: str, exchange: str = "NASDAQ", timeframe: str = "1
 
 # ── Backtest tools ─────────────────────────────────────────────────────────────
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(title="Strategy Backtest", readOnlyHint=True, destructiveHint=False, openWorldHint=True))
 def backtest_strategy(
     symbol: str,
     strategy: str,
@@ -626,7 +683,7 @@ def backtest_strategy(
     )
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(title="Strategy Comparison Race", readOnlyHint=True, destructiveHint=False, openWorldHint=True))
 def compare_strategies(
     symbol: str,
     period: str = "1y",
@@ -646,7 +703,7 @@ def compare_strategies(
     return _compare_strategies(symbol, period, initial_capital, interval=interval)
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(title="Walk-Forward Backtest", readOnlyHint=True, destructiveHint=False, openWorldHint=True))
 def walk_forward_backtest_strategy(
     symbol: str,
     strategy: str,
@@ -682,17 +739,17 @@ def walk_forward_backtest_strategy(
 
 # ── Yahoo Finance tools ────────────────────────────────────────────────────────
 
-@mcp.tool()
-def yahoo_price(symbol: str) -> dict:
+@mcp.tool(annotations=ToolAnnotations(title="Real-Time Price Quote", readOnlyHint=True, destructiveHint=False, openWorldHint=True))
+async def yahoo_price(symbol: str) -> dict:
     """Real-time price quote from Yahoo Finance for any stock, crypto, ETF or index.
 
     Args:
         symbol: Yahoo Finance symbol — e.g. AAPL, BTC-USD, SPY, ^GSPC, EURUSD=X, THYAO.IS
     """
-    return get_price(normalize_yahoo_symbol(symbol))
+    return await get_price_async(normalize_yahoo_symbol(symbol))
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(title="Global Market Snapshot", readOnlyHint=True, destructiveHint=False, openWorldHint=True))
 def market_snapshot() -> dict:
     """Global market overview: major indices, top crypto, FX rates, and key ETFs.
     Powered by Yahoo Finance.
@@ -700,7 +757,7 @@ def market_snapshot() -> dict:
     return get_market_snapshot()
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(title="Bitcoin Market Pulse", readOnlyHint=True, destructiveHint=False, openWorldHint=True))
 def bitcoin_market_pulse() -> dict:
     """Single-call BTC macro context: price, dominance, total market cap + risk assessment.
 
@@ -720,8 +777,8 @@ def bitcoin_market_pulse() -> dict:
     return get_bitcoin_market_pulse()
 
 
-@mcp.tool()
-def stock_extended_hours(symbol: str) -> dict:
+@mcp.tool(annotations=ToolAnnotations(title="Extended-Hours Stock Price", readOnlyHint=True, destructiveHint=False, openWorldHint=True))
+async def stock_extended_hours(symbol: str) -> dict:
     """Real-time pre-market and after-hours prices for a US stock symbol.
 
     Use this when the user asks about a stock outside the regular 9:30am-4pm
@@ -743,10 +800,10 @@ def stock_extended_hours(symbol: str) -> dict:
         - post_market: {price, as_of_utc, change_vs_regular_close_pct} or null
         - previous_close, currency, exchange, market_state for context
     """
-    return get_extended_hours_price(symbol)
+    return await get_extended_hours_price_async(symbol)
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(title="Options Chain", readOnlyHint=True, destructiveHint=False, openWorldHint=True))
 def stock_options_chain(symbol: str, expiry: Optional[str] = None) -> dict:
     """Full options chain (calls + puts) for a US stock symbol and one expiry.
 
@@ -772,7 +829,7 @@ def stock_options_chain(symbol: str, expiry: Optional[str] = None) -> dict:
     return get_options_chain(symbol, expiry)
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(title="Unusual Options Activity", readOnlyHint=True, destructiveHint=False, openWorldHint=True))
 def stock_options_unusual_activity(
     symbol: str,
     top_n: int = 10,
@@ -812,6 +869,167 @@ def stock_options_unusual_activity(
     return get_unusual_options_activity(symbol, top_n, min_volume, expiries)
 
 
+# ── Futures tools ─────────────────────────────────────────────────────────────
+
+@mcp.tool(annotations=ToolAnnotations(title="Futures Market Overview", readOnlyHint=True, destructiveHint=False, openWorldHint=True))
+def futures_market_overview(
+    category: str = "all",
+    exchanges: str = "us",
+    limit: int = 30,
+    volume_min: int = 0,
+) -> dict:
+    """Top futures contracts sorted by trading volume.
+
+    Args:
+        category:   all | equity_index | energy | metals | agriculture | rates | forex | crypto_futures
+        exchanges:  us (CME, COMEX, NYMEX, CBOT) | global (adds ICE, EUREX)
+        limit:      max contracts to return (default 30)
+        volume_min: minimum volume filter (0 = no filter)
+
+    Returns:
+        Dict with total_available count and list of contracts with OHLCV + % change.
+    """
+    try:
+        return get_futures_overview(
+            category=category,
+            exchanges=exchanges,
+            limit=limit,
+            volume_min=volume_min,
+        )
+    except Exception as exc:
+        # NOTE: was ErrorCode.SERVICE_ERROR — a member that never existed, so
+        # this handler itself raised AttributeError instead of returning.
+        return make_error(ErrorCode.UPSTREAM_ERROR, f"Futures overview failed: {exc}", retryable=True)
+
+
+@mcp.tool(annotations=ToolAnnotations(title="Futures Top Movers", readOnlyHint=True, destructiveHint=False, openWorldHint=True))
+def futures_top_movers(
+    direction: str = "gainers",
+    exchanges: str = "us",
+    limit: int = 20,
+    volume_min: int = 10,
+) -> dict:
+    """Futures contracts with the biggest percentage moves today.
+
+    Args:
+        direction:  gainers | losers
+        exchanges:  us | global
+        limit:      max results
+        volume_min: minimum volume filter (default 10, filters illiquid contracts)
+
+    Returns:
+        List of futures ranked by % change with OHLCV data.
+    """
+    direction = direction.lower()
+    if direction not in ("gainers", "losers"):
+        direction = "gainers"
+    try:
+        return get_futures_movers(
+            direction=direction,
+            exchanges=exchanges,
+            limit=limit,
+            volume_min=volume_min,
+        )
+    except Exception as exc:
+        return make_error(ErrorCode.UPSTREAM_ERROR, f"Futures movers failed: {exc}", retryable=True)
+
+
+@mcp.tool(annotations=ToolAnnotations(title="Futures Category Snapshot", readOnlyHint=True, destructiveHint=False, openWorldHint=True))
+def futures_category_snapshot(category: str = "energy") -> dict:
+    """Quote all major front-month contracts in a specific futures category.
+
+    Args:
+        category: equity_index | energy | metals | agriculture | rates | forex | crypto_futures
+
+    Returns:
+        OHLCV quotes for the standard watchlist of contracts in that category.
+        Example symbols: ES1! NQ1! (equity_index), CL1! NG1! (energy), GC1! SI1! (metals).
+    """
+    return get_futures_category_snapshot(category)
+
+
+@mcp.tool(annotations=ToolAnnotations(title="Futures Watchlist", readOnlyHint=True, destructiveHint=False, openWorldHint=True))
+def futures_watchlist() -> dict:
+    """Return the full categorized list of well-known front-month futures symbols.
+
+    Categories: equity_index, energy, metals, agriculture, rates, forex, crypto_futures.
+    Use these symbols with futures_category_snapshot or coin_analysis for deeper analysis.
+    """
+    return get_futures_watchlist()
+
+
+@mcp.tool(annotations=ToolAnnotations(title="US Stock Screener", readOnlyHint=True, destructiveHint=False, openWorldHint=True))
+async def stock_screener(
+    country: str = "america",
+    stock_type: str = "common",
+    limit: int = 50,
+    exclude_otc: bool = True,
+    compact: bool = False,
+    sort_by: str = "market_cap",
+) -> dict:
+    """Screen stocks by share type — the API twin of TradingView's
+    "Common stock" / "Preferred stock" symbol-search filter.
+
+    Args:
+        country: TradingView market name — e.g. america, korea, germany,
+            brazil, japan, uk, india, turkey, canada, australia, france, hongkong
+        stock_type: common | preferred
+        limit: rows to return (max 2000, single upstream request), ranked by market cap descending
+        exclude_otc: default True — drop OTC listings (foreign companies traded
+            over-the-counter); "america" otherwise means "US venue", not "US company"
+        compact: default False — True returns only ticker/symbol/price/currency/
+            change_percent per row (light payload for bulk price feeds)
+        sort_by: market_cap (default) | dividend_yield | change | price —
+            server-side descending sort over the WHOLE market, so e.g.
+            sort_by=dividend_yield with limit=20 is the market's true top-20
+            dividend payers, not just the biggest companies re-sorted
+
+    Returns:
+        Envelope dict: total_matches (market-wide count), returned, and rows
+        of {ticker, symbol, description, exchange, price, open, high, low,
+        currency, change_percent, dividend_yield, market_cap} — price is the
+        current/last close; open/high/low are the current session's daily bar. Prices are in the
+        market's local currency (e.g. KRW for korea).
+    """
+    try:
+        # tradingview-screener is sync (urllib) — off-load to a worker thread
+        # so the event loop stays free for concurrent tool calls.
+        return await asyncio.to_thread(
+            screen_stocks, country, stock_type, limit, exclude_otc, compact, sort_by
+        )
+    except ValueError as e:
+        return make_error(ErrorCode.INVALID_PARAMETER, str(e))
+    except Exception as e:
+        return make_error(
+            ErrorCode.UPSTREAM_ERROR,
+            f"scan failed for market {country!r}: {e}",
+            known_good_markets=list(EXAMPLE_MARKETS),
+        )
+
+
+@mcp.tool(annotations=ToolAnnotations(title="Multi-Symbol Stock Prices", readOnlyHint=True, destructiveHint=False, openWorldHint=True))
+async def stock_prices(tickers: str) -> dict:
+    """Current price + daily % change for specific stock symbols.
+
+    Args:
+        tickers: comma-separated EXCHANGE:SYMBOL list (max 2000 — one
+            upstream request even at full size), e.g.
+            "NASDAQ:NVDA, NASDAQ:TSLA, KRX:005930". The exchange prefix is
+            required — the scanner's direct-ticker lookup is exchange-scoped.
+
+    Returns:
+        Envelope dict: rows of {ticker, symbol, description, exchange, price,
+        open, high, low, currency, change_percent} plus a not_found list naming any requested
+        ticker the scanner didn't recognize.
+    """
+    try:
+        return await asyncio.to_thread(fetch_stock_prices, tickers)
+    except ValueError as e:
+        return make_error(ErrorCode.INVALID_PARAMETER, str(e))
+    except Exception as e:
+        return make_error(ErrorCode.UPSTREAM_ERROR, f"price lookup failed: {e}")
+
+
 # ── Resource ───────────────────────────────────────────────────────────────────
 
 @mcp.resource("exchanges://list")
@@ -834,6 +1052,43 @@ def exchanges_list() -> str:
 
 
 # ── Entry point ────────────────────────────────────────────────────────────────
+
+# ---------------------------------------------------------------------------
+# Blanket async offload for every still-synchronous tool.
+#
+# mcp 1.12.x calls sync tool functions BARE on the event loop
+# (func_metadata.call_fn_with_arg_validation ends in `return fn(**kwargs)`),
+# so one slow scan stalls every concurrent session. Seven hot paths were
+# hand-converted to async (#49), which left an arbitrary split — top_gainers
+# offloaded while its twin top_losers blocked (issue #77). Rather than
+# maintaining that list tool-by-tool, wrap whatever is still sync at import
+# time in asyncio.to_thread. Tools added later are covered automatically the
+# moment this module loads. Argument validation is untouched: FastMCP
+# validates against fn_metadata (built from the ORIGINAL signature via
+# functools.wraps) and then calls fn(**parsed_kwargs), which the wrapper
+# forwards verbatim.
+# ---------------------------------------------------------------------------
+def _offload_sync_tools() -> int:
+    import functools
+
+    converted = 0
+    for _tool in mcp._tool_manager.list_tools():
+        if _tool.is_async:
+            continue
+        _sync_fn = _tool.fn
+
+        @functools.wraps(_sync_fn)
+        async def _threaded(*args, __sync_fn=_sync_fn, **kwargs):
+            return await asyncio.to_thread(__sync_fn, *args, **kwargs)
+
+        _tool.fn = _threaded
+        _tool.is_async = True
+        converted += 1
+    return converted
+
+
+_OFFLOADED_TOOL_COUNT = _offload_sync_tools()
+
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="TradingView Screener MCP server")

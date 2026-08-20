@@ -16,17 +16,23 @@ import sys
 import time as _time
 from typing import Any, List, Optional
 
-from tradingview_mcp.core.errors import BatchExecutionError
+from tradingview_mcp.core.errors import (
+    BatchExecutionError,
+    ErrorCode,
+    ScreenerServiceError,
+    is_error,
+    make_error,
+)
 from tradingview_mcp.core.types import (
     IndicatorMap, MultiRow, Row,
     percent_change, tf_to_tv_resolution,
 )
-from tradingview_mcp.core.services.coinlist import load_symbols
+from tradingview_mcp.core.services.coinlist import exchanges_listing_symbol, load_symbols
 from tradingview_mcp.core.services.indicators import compute_metrics
 from tradingview_mcp.core.utils.validators import EXCHANGE_SCREENER, get_market_type
 
 # Resilience layer (does not require tradingview_ta; safe to import unconditionally).
-from tradingview_mcp.core.services.screener_provider import _scan_with_retry
+from tradingview_mcp.core.services.screener_provider import _scan_with_retry, humanize_upstream_error
 
 try:
     # Patched: route through resilience layer (retry + 60s TTL cache).
@@ -116,11 +122,19 @@ def fetch_bollinger_analysis(
         List of Row dicts sorted by changePercent descending.
     """
     if not _TA_AVAILABLE:
-        raise RuntimeError("tradingview_ta is missing; run `uv sync`.")
+        raise ScreenerServiceError(
+            ErrorCode.DEPENDENCY_MISSING,
+            "tradingview_ta is missing; run `uv sync`.",
+            retryable=False,
+        )
 
     symbols = load_symbols(exchange)
     if not symbols:
-        raise RuntimeError(f"No symbols found for exchange: {exchange}")
+        raise ScreenerServiceError(
+            ErrorCode.NO_DATA,
+            f"No symbols found for exchange: {exchange}",
+            exchange=exchange, retryable=False,
+        )
 
     symbols = symbols[: limit * 2]
     screener = EXCHANGE_SCREENER.get(exchange, "crypto")
@@ -128,7 +142,13 @@ def fetch_bollinger_analysis(
     try:
         analysis = get_multiple_analysis(screener=screener, interval=timeframe, symbols=symbols)
     except Exception as exc:
-        raise RuntimeError(f"Analysis failed: {exc}") from exc
+        # Single-shot fetch (no batching here): a failure is an upstream
+        # problem, and TradingView storms pass — mark it retryable.
+        raise ScreenerServiceError(
+            ErrorCode.UPSTREAM_ERROR,
+            f"Analysis failed: {humanize_upstream_error(exc)}",
+            retryable=True,
+        ) from exc
 
     rows: List[Row] = []
     for key, value in analysis.items():
@@ -188,11 +208,19 @@ def fetch_trending_analysis(
         List of Row dicts sorted by changePercent descending.
     """
     if not _TA_AVAILABLE:
-        raise RuntimeError("tradingview_ta is missing; run `uv sync`.")
+        raise ScreenerServiceError(
+            ErrorCode.DEPENDENCY_MISSING,
+            "tradingview_ta is missing; run `uv sync`.",
+            retryable=False,
+        )
 
     symbols = load_symbols(exchange)
     if not symbols:
-        raise RuntimeError(f"No symbols found for exchange: {exchange}")
+        raise ScreenerServiceError(
+            ErrorCode.NO_DATA,
+            f"No symbols found for exchange: {exchange}",
+            exchange=exchange, retryable=False,
+        )
 
     screener = EXCHANGE_SCREENER.get(exchange, "crypto")
     batch_size = 200
@@ -568,10 +596,64 @@ def fetch_multi_timeframe_patterns(
 
 # ── Coin analysis (single asset) ───────────────────────────────────────────────
 
+# Preference order for auto-venue fallback. Telemetry: one paying customer's
+# hourly automation asked for HYPEUSDT@binance 100+ times a week; the
+# SYMBOL_NOT_FOUND envelope named the right venues but the automation never
+# read it. When the requested venue doesn't list a ticker that another venue
+# does, failing a deterministic request helps nobody — analyze on a listing
+# venue and SAY SO in the response (requested_exchange/resolved_exchange).
+# KUCOIN/MEXC first: their screener rows have been the most complete for the
+# long-tail tickers this fallback exists for.
+_FALLBACK_VENUE_PREFERENCE = ("KUCOIN", "MEXC", "GATEIO", "BYBIT", "OKX", "HUOBI")
+
+
+def pick_fallback_exchange(symbol: str, requested_exchange: str) -> Optional[str]:
+    """Best alternative venue that actually lists `symbol`, or None."""
+    listed = [e.upper() for e in exchanges_listing_symbol(symbol)]
+    req = (requested_exchange or "").upper()
+    candidates = [e for e in listed if e != req]
+    if not candidates:
+        return None
+    for pref in _FALLBACK_VENUE_PREFERENCE:
+        if pref in candidates:
+            return pref
+    return candidates[0]
+
+
+def symbol_not_found_error(symbol: str, exchange: str, **context: Any) -> dict:
+    """SYMBOL_NOT_FOUND envelope with actionable, locally-sourced suggestions.
+
+    Telemetry showed agents retrying the exact same not-found request dozens
+    of times (e.g. HYPEUSDT on BINANCE) because the old bare-string error gave
+    no retryability signal and no alternative. This envelope says explicitly:
+    not retryable here, but *these* exchanges list the ticker (from the bundled
+    coinlists — zero network cost).
+    """
+    listed_on = exchanges_listing_symbol(symbol)
+    message = f"No data found for {symbol} on {exchange}."
+    if listed_on:
+        message += (
+            " Retrying on this exchange will fail again; the symbol is listed on: "
+            + ", ".join(listed_on)
+            + ". Retry with one of those as `exchange`."
+        )
+    else:
+        message += (
+            " No local listing found on any supported exchange — verify the ticker"
+            " spelling; retrying the same request will return the same error."
+        )
+    return make_error(
+        ErrorCode.SYMBOL_NOT_FOUND, message,
+        retryable=False, symbol=symbol, exchange=exchange, listed_on=listed_on,
+        **context,
+    )
+
+
 def analyze_coin(
     symbol: str,
     exchange: str,
     timeframe: str,
+    _allow_venue_fallback: bool = True,
 ) -> dict:
     """
     Full technical analysis for a single coin/stock.
@@ -606,7 +688,19 @@ def analyze_coin(
         analysis = get_multiple_analysis(screener=screener, interval=timeframe, symbols=[full_symbol])
 
         if full_symbol not in analysis or analysis[full_symbol] is None:
-            return {"error": f"No data found for {symbol} on {exchange}", "symbol": symbol, "exchange": exchange, "timeframe": timeframe}
+            if _allow_venue_fallback:
+                alt = pick_fallback_exchange(symbol, exchange)
+                if alt:
+                    result = analyze_coin(symbol, alt, timeframe, _allow_venue_fallback=False)
+                    if not is_error(result):
+                        result["requested_exchange"] = exchange
+                        result["resolved_exchange"] = alt
+                        result["resolution_note"] = (
+                            f"{symbol} is not listed on {exchange}; analysis was run on "
+                            f"{alt}, which lists it. Pass exchange=\"{alt}\" to silence this note."
+                        )
+                        return result
+            return symbol_not_found_error(symbol, exchange, timeframe=timeframe)
 
         data = analysis[full_symbol]
         indicators = data.indicators
@@ -699,7 +793,15 @@ def analyze_coin(
             **trade_data,
         }
     except Exception as exc:
-        return {"error": f"Analysis failed: {exc}", "symbol": symbol, "exchange": exchange, "timeframe": timeframe}
+        # Transient upstream outages (TradingView's 30-90s empty-body cliffs)
+        # dominate this path — signal machine-readable retryability so agents
+        # wait-and-retry instead of hammering or giving up.
+        return make_error(
+            ErrorCode.UPSTREAM_ERROR,
+            f"Analysis failed: {humanize_upstream_error(exc)}",
+            retryable=True, retry_after_s=60,
+            symbol=symbol, exchange=exchange, timeframe=timeframe,
+        )
 
 
 # ── Consecutive candle pattern scan ────────────────────────────────────────────
@@ -739,7 +841,12 @@ def scan_consecutive_candles(
     try:
         analysis = get_multiple_analysis(screener=screener, interval=timeframe, symbols=symbols)
     except Exception as exc:
-        return {"error": f"Pattern analysis failed: {exc}", "exchange": exchange, "timeframe": timeframe}
+        return make_error(
+            ErrorCode.UPSTREAM_ERROR,
+            f"Pattern analysis failed: {humanize_upstream_error(exc)}",
+            retryable=True, retry_after_s=60,
+            exchange=exchange, timeframe=timeframe,
+        )
 
     pattern_coins: list[dict] = []
 

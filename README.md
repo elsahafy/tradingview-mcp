@@ -1,21 +1,74 @@
-# 📈 AI Trading Intelligence Framework — MCP Server
+# TradingView MCP Market Data & Technical Analysis for AI Assistants
 
 <a href="https://trendshift.io/repositories/25110" target="_blank"><img src="https://trendshift.io/api/badge/repositories/25110" alt="atilaahmettaner%2Ftradingview-mcp | Trendshift" style="width: 250px; height: 55px;" width="250" height="55"/></a>
 
-**The most complete AI-powered trading toolkit for Claude and MCP clients.**
-Backtesting + Live Sentiment + Yahoo Finance + 30+ Technical Analysis Tools — all in one MCP server.
+**TradingView MCP server** — real-time market data, technical indicators, screeners, and backtesting for Claude, ChatGPT, Cursor, Copilot, and any MCP client. Stocks, crypto, forex & futures across global exchanges.
+Backtesting + live sentiment + Yahoo Finance + 37 technical-analysis tools — the most complete TradingView MCP toolkit, all in one server.
+
+<p align="center">
+  <img src=".github/assets/tradingview-mcp-demo.gif" width="820" alt="TradingView MCP in an AI chat: ask for the top gainers on Binance and get ranked, real-time results — one of 37 tools" />
+</p>
+
+**🆕 The hosted server now draws.** Ask for a chart and an interactive candlestick view (1d / 1h / 15m, optional Bollinger overlay) renders live **inside the conversation** via MCP Apps — and the AI reads the band values back to you:
+
+<p align="center">
+  <img src="docs/assets/bollinger-15m-chart-demo.gif" width="820" alt="MCP Apps demo: asking Claude for a 15-minute Bollinger chart — an interactive candlestick chart with Bollinger Bands renders inside the conversation and Claude analyzes the band values" />
+</p>
+
+**Paste one URL (or `pip install`), then just ask.** Real output, straight from the live server:
+
+<p align="center">
+  <img src="assets/showcase-top-gainers.png" width="820" alt="Real output: top crypto gainers on KuCoin with 24h change, RSI and signal — ranked table returned in chat" />
+</p>
+<p align="center">
+  <img src="assets/showcase-gold-mtf.png" width="820" alt="Real output: multi-timeframe gold analysis — weekly to 15m trend alignment with a LEAN BULLISH verdict" />
+</p>
+
+**Try these first** — they work in Claude, ChatGPT, Cursor, or any MCP client:
+
+```text
+Show today's top crypto gainers on Binance
+Run a full technical analysis of NVDA
+What's the multi-timeframe read on gold?
+Backtest an RSI strategy on BTC on the daily timeframe
+```
+
+> [!NOTE]
+> Independent open-source project — **not affiliated with, endorsed by, or associated with TradingView Inc.** "TradingView" is a trademark of its respective owner; this project consumes third-party market data and is not a TradingView product.
+
+> [!NOTE]
+> **Does it need — or risk — your TradingView account? No.** This server does **not** log into, scrape, or automate a TradingView session, and it requires no TradingView account or API key. Market data is fetched server-side from public endpoints, so there is no account of yours in the loop and no browser/UI automation. *(This is different from MCP servers that drive the TradingView Desktop app via Chrome DevTools.)* You are responsible for ensuring your own use complies with the terms of any data source you point it at.
+
+<details>
+<summary><b>How this compares to desktop-automation TradingView MCPs</b> (the ones that remote-control TradingView Desktop)</summary>
+<br>
+
+"TradingView MCP" now means two very different kinds of project. Both are useful — for different jobs:
+
+| | **This project — data & analysis API** | **Desktop-automation MCPs** |
+|---|---|---|
+| What you need | Nothing — public market data | TradingView Desktop, usually with a paid TradingView plan |
+| Where it works | Claude.ai, Claude Code, ChatGPT, Cursor, Copilot — any MCP client | Mostly Claude Code, on your own machine |
+| When your machine is off | Hosted version keeps answering, 24/7 | Stops |
+| Screeners & backtesting | Built in (37 tools, multi-exchange) | Whatever the TradingView UI offers |
+| Charts | Interactive in-conversation charts (MCP Apps, hosted) | TradingView's own charts |
+| Your TradingView account | Not needed, never touched | Drives your logged-in session |
+
+If you want an AI clicking around *your* TradingView Desktop — editing Pine Script, drawing on charts, using replay — check out [tradesdontlie/tradingview-mcp](https://github.com/tradesdontlie/tradingview-mcp). If you want headless market data, screeners and backtesting available to any AI client, with nothing installed and no TradingView account in the loop — that's this project.
+
+</details>
 
 > [!IMPORTANT]
 > **Not financial advice.** Nothing produced by this software is investment, financial, legal, tax, or accounting advice. tradingview-mcp is an informational and educational analysis tool. Its outputs, including indicators, scores, signals, "trade setups", entries, stop losses, and targets, are computed from third party market data and are **not** recommendations to buy, sell, or hold any asset. It does not execute trades, manage money, or guarantee any result. Trading and investing carry a substantial risk of loss, and you can lose some or all of your capital. Always do your own research and consult a licensed professional before making any financial decision. You are solely responsible for your own decisions and for complying with the laws and regulations that apply to you. Market data may be delayed, inaccurate, or incomplete, and is provided without warranty.
 
 > [!TIP]
-> **Skip the setup. Use the hosted version.** [**pro.cryptosieve.com**](https://pro.cryptosieve.com) gives you all 30+ tools as one connector URL for Claude.ai, ChatGPT, Copilot, and Cursor. No `uv`, `pandas`, or Python to wrangle. **$9 per month, with a 3 day free trial.** Self hosting stays free forever; the hosted plan is just for folks who would rather skip the ops.
+> **Prefer zero setup? Use the hosted version.** [**pro.cryptosieve.com**](https://pro.cryptosieve.com) serves all 37 tools as one connector URL for Claude.ai, ChatGPT, Copilot, and Cursor — no `uv`, `pandas`, or Python to wrangle. **From $9/mo (Pro) or $29/mo (Pro+ — higher limits), with a 3-day free trial.** Self-hosting stays free forever; hosted is just for folks who'd rather skip the ops. *(Full self-host vs hosted comparison in Quick Start below.)*
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
-[![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
+[![Python 3.10-3.13](https://img.shields.io/badge/python-3.10--3.13-blue.svg)](https://www.python.org/downloads/)
 [![MCP Ready](https://img.shields.io/badge/MCP-Ready-brightgreen)](https://modelcontextprotocol.com/)
 [![OpenClaw Ready](https://img.shields.io/badge/OpenClaw-Ready-blueviolet)](https://openclaw.ai)
-[![Version](https://img.shields.io/badge/version-v0.7.0-blue)](https://github.com/atilaahmettaner/tradingview-mcp/releases)
+[![Version](https://img.shields.io/badge/version-v0.8.0-blue)](https://github.com/atilaahmettaner/tradingview-mcp/releases)
 [![PyPI](https://img.shields.io/badge/PyPI-tradingview--mcp--server-orange)](https://pypi.org/project/tradingview-mcp-server/)
 [![GitHub Sponsors](https://img.shields.io/badge/Sponsor-❤️-pink?logo=github-sponsors)](https://github.com/sponsors/atilaahmettaner)
 
@@ -43,6 +96,7 @@ https://github-production-user-asset-6210df.s3.amazonaws.com/67838093/478689497-
 
 **Stability & Strategy Expansion (May 2026)**
 
+- **Async hot-path tools** — 7 high-traffic tools (`yahoo_price`, `stock_extended_hours`, `top_gainers`, `volume_breakout_scanner`, `multi_timeframe_analysis`, `financial_news`, `combined_analysis`) converted to `async def`. FastMCP runs sync tools serialized on the event loop — async unlocks real intra-server parallelism so concurrent tool calls actually overlap. `combined_analysis` additionally fans its 3 sub-calls out via `asyncio.gather` for ~3× wall-clock improvement on the power tool. `yahoo_price` / `stock_extended_hours` use `httpx.AsyncClient` for true non-blocking I/O; sync-library tools (`tradingview_ta`, `tradingview-screener`, `feedparser`) are off-loaded via `asyncio.to_thread`. *(PR — open)*
 - **9 backtest strategies** (up from 6) — added `rsi_pullback`, `keltner_breakout`, and `triple_ema`, covering trend-pullback, ATR-normalized breakout, and SMA200-filtered EMA cross edges. `compare_strategies` now ranks the full 9.
 - **Resilience layer** — automatic retry + 60-second TTL cache on the TradingView screener provider, eliminating transient `"Expecting value"` errors on `combined_analysis` and `multi_timeframe_analysis`. *(PR [#32](https://github.com/atilaahmettaner/tradingview-mcp/pull/32) — merged)*
 - **Financial news service rebuild** — replaces deprecated Reuters RSS endpoints with Yahoo Finance, MarketWatch, and CNBC. Fixes the long-standing `count: 0` bug on `financial_news`. *(PR [#33](https://github.com/atilaahmettaner/tradingview-mcp/pull/33) — merged)*
@@ -74,10 +128,38 @@ https://github-production-user-asset-6210df.s3.amazonaws.com/67838093/478689497-
 
 ## 🚀 Quick Start (5 Minutes)
 
+**Two ways to run it — the same 37 tools either way:**
+
+| | 🧑‍💻 Self-host (this repo) | ☁️ Hosted — [pro.cryptosieve.com](https://pro.cryptosieve.com) |
+|---|---|---|
+| **Price** | Free forever (MIT) | $9/mo Pro · $29/mo Pro+ · 3-day trial |
+| **Time to first call** | ~5 minutes (Python + `uv`) | ~60 seconds (paste one URL) |
+| **Updates & ops** | You run and update it | Managed — always on the latest |
+| **Runs on** | Your machine or VPS | Hosted, streamed from the edge |
+| **Limits** | Your hardware | 2,500/mo · 60/min (Pro) → 10,000/mo · 150/min (Pro+) |
+| **Best for** | Tinkerers, forkers, full control | Folks who'd rather skip the ops |
+
+> ☁️ **Zero setup:** paste one connector URL into Claude.ai, ChatGPT, Copilot, or Cursor → **[start a 3-day free trial](https://pro.cryptosieve.com)**. Everything below is for self-hosting.
+
 ### Install via pip
 ```bash
 pip install tradingview-mcp-server
 ```
+
+### Optional: news & sentiment (free Marketaux key)
+
+`financial_news` and `market_sentiment` (plus the news/sentiment parts of
+`combined_analysis`) are powered by [Marketaux](https://www.marketaux.com/) —
+licensed market news with per-entity sentiment. Grab a **free API key**
+(100 requests/day; the server caches for 4h and shares one fetch between news
+and sentiment, so the free tier goes a long way) and set:
+
+```bash
+export MARKETAUX_API_TOKEN=your_token_here   # optional
+```
+
+Without a token those two tools return a friendly "not configured" note — all
+other tools work normally.
 
 ### Claude Desktop Config (`claude_desktop_config.json`)
 
@@ -140,7 +222,7 @@ Symptom — you see this in the Claude Desktop logs shortly after adding the con
 [tradingview] notifications/cancelled — reason: "MCP error -32001: Request timed out"
 ```
 
-**Why it happens:** on Windows with Python 3.14, `uvx` downloads `tradingview-mcp-server`, creates a fresh virtualenv, and installs dependencies the first time it runs. Because `pandas` has no prebuilt wheel for Python 3.14 yet, pip falls back to a source build — which typically exceeds Claude Desktop's 60-second MCP initialization timeout.
+**Why it happens:** Python 3.14 is not supported yet. `uvx` downloads `tradingview-mcp-server`, creates a fresh virtualenv, and installs dependencies the first time it runs. Some native dependencies in the MCP stack do not currently publish compatible Python 3.14 wheels, so installation can fall back to source builds or fail before Claude Desktop finishes initializing the server.
 
 **Fix — pin to Python 3.13 (has prebuilt pandas wheels):**
 
@@ -175,12 +257,14 @@ After the install finishes, start Claude Desktop with the normal config and the 
 Tools that have adopted the structured error format return either their normal payload **or** an error envelope:
 
 ```json
-{"error": {"code": "ALL_BATCHES_FAILED", "message": "All 5 batches failed; first error: JSONDecodeError(...)", "batches_attempted": 5, "batches_failed": 5, "first_error": "..."}}
+{"error": {"code": "ALL_BATCHES_FAILED", "message": "All 5 batches failed; first error: JSONDecodeError(...)", "batches_attempted": 5, "batches_failed": 5, "first_error": "...", "retryable": true}}
 ```
 
-**Why:** the previous `[]` / `{"error": "Analysis failed: ..."}` strings made it impossible to distinguish "no matches today" from "upstream rate-limit cliff." The new envelope is programmatically branchable by `code`.
+**Why:** the previous `[]` / `{"error": "Analysis failed: ..."}` strings made it impossible to distinguish "no matches today" from "upstream rate-limit cliff." The new envelope is programmatically branchable by `code`, and `retryable` tells the caller whether waiting and retrying can help (upstream storms pass; a missing dependency won't fix itself).
 
-**Currently adopted by:** `top_gainers`, `top_losers`, `rating_filter`, `volume_breakout_scanner`, `smart_volume_scanner`. More tools will follow in subsequent PRs.
+**Full coverage** (every failure mode — upstream outage, empty symbol list, missing dependency, unexpected exception — returns an envelope, never a raw string/traceback): `top_gainers`, `top_losers`, `bollinger_scan`, `rating_filter`, `volume_breakout_scanner`, `smart_volume_scanner`.
+
+**Partial adoption** (main error paths return envelopes): `coin_analysis`, `volume_confirmation_analysis`, `consecutive_candles_scan`, `futures_market_overview`, `futures_top_movers`, `stock_prices`, and the backtest input guards. Remaining tools migrate in batches — tracked in [#76](https://github.com/atilaahmettaner/tradingview-mcp/issues/76).
 
 **Detecting an error:**
 
@@ -188,7 +272,7 @@ Tools that have adopted the structured error format return either their normal p
 result = volume_breakout_scanner(exchange="KUCOIN")
 if isinstance(result, dict) and "error" in result:
     code = result["error"]["code"]
-    if code == "ALL_BATCHES_FAILED":
+    if result["error"].get("retryable"):
         # Wait + retry, raise alert, fall back to single-batch call, etc.
         ...
 else:
@@ -305,7 +389,7 @@ Unlike basic screeners, this framework deploys **specialized AI agents** that de
 
 ---
 
-## 🔧 All 30+ MCP Tools
+## 🔧 All 37 MCP Tools
 
 ### 📊 Backtesting Engine
 
@@ -348,6 +432,15 @@ Example prompt: "Compare all 9 strategies on MSFT for 2 years"
 | `market_snapshot` | Global overview: S&P500, NASDAQ, VIX, BTC, ETH, EUR/USD, SPY, GLD |
 
 **Supports:** Stocks (AAPL, TSLA, NVDA), Crypto (BTC-USD, ETH-USD, SOL-USD), ETFs (SPY, QQQ, GLD), Indices (^GSPC, ^DJI, ^IXIC, ^VIX), FX (EURUSD=X), Turkish (THYAO.IS, SASA.IS)
+
+---
+
+### 🌍 Global Stock Screener — Common & Preferred Shares
+
+| Tool | Description |
+|------|-------------|
+| `stock_screener` | List common or preferred stocks for any TradingView country market (america, korea, germany, brazil, …) with price, currency, % change, dividend yield — ranked by market cap. The API twin of TradingView's "Common stock" / "Preferred stock" symbol-search filter. |
+| `stock_prices` | Direct price lookup for specific symbols (comma-separated `EXCHANGE:SYMBOL`, e.g. `NASDAQ:NVDA, KRX:005930`) — price, currency, daily % change, with unrecognized tickers named in `not_found`. |
 
 ---
 
